@@ -1,16 +1,25 @@
 import warnings
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import (
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 # ==============================================================================
-# 1. CARGA DE MUESTRA DEL RBA DATASET (INTACTO)
+# 1. CARGA DE MUESTRA DEL RBA DATASET
 # ==============================================================================
 FILE_PATH = "/kaggle/input/datasets/dasgroup/rba-dataset/rba-dataset.csv"
 
@@ -39,10 +48,11 @@ for col in cat_cols:
   df[col + "_freq"] = df[col].map(freq)
 
 # ==============================================================================
-# 2. INGENIERÍA DE CARACTERÍSTICAS POR USUARIO (INTACTO)
+# 2. INGENIERÍA DE CARACTERÍSTICAS POR USUARIO Y CRUCES DE INTERACCIÓN
 # ==============================================================================
-print("Calculando histórico y variables relativas por usuario...")
+print("Calculando histórico y nuevas variables contextuales por usuario...")
 
+# 2.1 Desviación de latencia histórica
 df["user_rtt_mean_prev"] = df.groupby("User ID")["RTT_clean"].transform(
     lambda x: x.shift(1).expanding().mean()
 )
@@ -51,6 +61,7 @@ df["user_delta_rtt"] = (
 )
 
 
+# 2.2 Detección de nuevas entidades en la historia del usuario
 def flag_new_entity(series):
   seen = set()
   flags = []
@@ -79,12 +90,42 @@ df["is_new_device_user"] = df.groupby("User ID")[
     "device_fingerprint"
 ].transform(flag_new_entity)
 
+# 2.3 Fallo inmediatamente anterior
 df["prev_failed_login"] = (
     df.groupby("User ID")["Login_Success_num"]
     .shift(1)
     .apply(lambda x: 1 if x == 0 else 0)
     .fillna(0)
 )
+
+# --- NUEVAS CARACTERÍSTICAS AÑADIDAS TRAS FEEDBACK ---
+
+# 2.4 Tiempo en segundos desde el último login (detección de fuerza bruta/diccionario)
+df["time_since_last_login"] = (
+    df.groupby("User ID")["Login Timestamp"]
+    .diff()
+    .dt.total_seconds()
+    .fillna(999999)
+)
+# Acotamos a un máximo de 7 días (604800 s) para evitar que valores extremos distorsionen el escalador
+df["time_since_last_login"] = df["time_since_last_login"].clip(
+    lower=0, upper=604800
+)
+
+# 2.5 Interacción cruzada País + ASN (detecta ASNs operando fuera de su región habitual)
+df["asn_x_country"] = df["Country"] + "_" + df["ASN"]
+freq_cross = df["asn_x_country"].value_counts(normalize=True)
+df["asn_x_country_freq"] = df["asn_x_country"].map(freq_cross)
+
+# 2.6 Cruce: Nuevo dispositivo + Fallo en el intento previo
+df["device_change_with_failed_login"] = (
+    (df["is_new_device_user"] == 1) & (df["prev_failed_login"] == 1)
+).astype(int)
+
+# 2.7 Cruce: Nuevo dispositivo + Fallo de contraseña en el intento actual
+df["device_change_on_failure"] = (
+    (df["is_new_device_user"] == 1) & (df["Login_Success_num"] == 0)
+).astype(int)
 
 # ==============================================================================
 # 3. PREPARACIÓN SUPERVISADA: DIVISIÓN TRAIN / TEST (80% / 20%)
@@ -103,6 +144,10 @@ features = [
     "is_new_asn_user",
     "is_new_device_user",
     "prev_failed_login",
+    "time_since_last_login",
+    "asn_x_country_freq",
+    "device_change_with_failed_login",
+    "device_change_on_failure",
 ]
 
 X = df[features]
@@ -110,61 +155,72 @@ y = ((df["Is Attack IP"] == True) | (df["Is Account Takeover"] == True)).astype(
     int
 )
 
-# Dividimos: 80% para enseñar al modelo (Train) y 20% oculto para examinarlo (Test)
-# stratify=y asegura que haya el mismo % de ataques (9%) tanto en Train como en Test
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.20, random_state=42, stratify=y
 )
 
-# IMPORTANTE EN SUPERVISADO: El escalador aprende SOLO de Train (fit_transform)
-# y se aplica a Test (transform) para no filtrar información del examen
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled = scaler.transform(X_test)
 
 total_ataques_test = int(y_test.sum())
 print(
-    f"Filas para Entrenar (80%): {len(X_train)} | Filas para Examen Test (20%):"
+    f"Filas Entrenamiento (80%): {len(X_train)} | Filas Test (20%):"
     f" {len(X_test)}"
 )
 print(
-    "Eventos maliciosos reales dentro del Examen Test:"
-    f" {total_ataques_test}\n"
+    f"Ataques reales en Test: {total_ataques_test} | Total variables:"
+    f" {len(features)}\n"
 )
 
 # ==============================================================================
-# 4. DEFINICIÓN DE LOS 3 ALGORITMOS SUPERVISADOS
+# 4. DEFINICIÓN DE MODELOS (INCLUYENDO KNN Y REGULARIZACIÓN ANTI-OVERFITTING)
 # ==============================================================================
-# class_weight='balanced' obliga al modelo a prestar mucha atención a los ataques
-# aunque solo sean el 9% de los datos.
 modelos_supervisados = {
     "1. Regresión Logística (Baseline)": LogisticRegression(
         class_weight="balanced", max_iter=1000, random_state=42
     ),
-    "2. Random Forest (200 árboles)": RandomForestClassifier(
-        n_estimators=200, class_weight="balanced", random_state=42, n_jobs=-1
+    "2. KNN (k=15, pesos distancia)": KNeighborsClassifier(
+        n_neighbors=15, weights="distance", n_jobs=-1
     ),
-    "3. HistGradientBoosting (Boosting)": HistGradientBoostingClassifier(
+    "3. Random Forest (Reg. Profundidad)": RandomForestClassifier(
+        n_estimators=200,
+        max_depth=12,
+        min_samples_leaf=20,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1,
+    ),
+    "4. HistGradientBoosting (Estándar)": HistGradientBoostingClassifier(
         class_weight="balanced", max_iter=200, random_state=42
+    ),
+    "5. HistGradientBoosting (Regularizado)": HistGradientBoostingClassifier(
+        class_weight="balanced",
+        max_iter=200,
+        max_leaf_nodes=15,
+        min_samples_leaf=50,
+        l2_regularization=1.5,
+        random_state=42,
     ),
 }
 
 # ==============================================================================
-# 5. ENTRENAMIENTO (.fit) Y EVALUACIÓN EN EL CONJUNTO DE TEST (.predict)
+# 5. ENTRENAMIENTO, EVALUACIÓN Y CAPTURA DE CURVAS ROC
 # ==============================================================================
 resultados = []
+curvas_roc = {}
 
 for nombre, modelo in modelos_supervisados.items():
   print(f"Entrenando y evaluando {nombre}...")
-
-  # 1. El modelo estudia con los datos de entrenamiento Y SUS ETIQUETAS (y_train)
   modelo.fit(X_train_scaled, y_train)
 
-  # 2. El modelo hace el examen sobre datos que NUNCA ha visto (X_test_scaled)
   y_pred = modelo.predict(X_test_scaled)
-  y_prob = modelo.predict_proba(X_test_scaled)[
-      :, 1
-  ]  # Probabilidad de riesgo (0.0 a 1.0)
+  y_prob = modelo.predict_proba(X_test_scaled)[:, 1]
+
+  # Guardamos datos para el plot de la curva ROC
+  fpr, tpr, thresholds = roc_curve(y_test, y_prob)
+  roc_auc = roc_auc_score(y_test, y_prob)
+  curvas_roc[nombre] = (fpr, tpr, thresholds, roc_auc, y_prob)
 
   alertas_totales = int(y_pred.sum())
   ataques_cazados = int(((y_pred == 1) & (y_test == 1)).sum())
@@ -175,7 +231,6 @@ for nombre, modelo in modelos_supervisados.items():
   recall = recall_score(y_test, y_pred, zero_division=0)
   precision = precision_score(y_test, y_pred, zero_division=0)
   f1 = f1_score(y_test, y_pred, zero_division=0)
-  roc_auc = roc_auc_score(y_test, y_prob)
 
   resultados.append({
       "Algoritmo Supervisado": nombre,
@@ -191,17 +246,98 @@ for nombre, modelo in modelos_supervisados.items():
   })
 
 df_res = pd.DataFrame(resultados)
-print("\n=== TABLA DE RESULTADOS (MODELOS SUPERVISADOS EN CONJUNTO DE TEST) ===")
+print(
+    "\n=== TABLA DE RESULTADOS CON 17 VARIABLES (CORTE POR DEFECTO P >= 0.50)"
+    " ==="
+)
 print(df_res.to_string(index=False))
 
 # ==============================================================================
-# 6. PONDERACIÓN AUTOMÁTICA DE VARIABLES (QUÉ HA APRENDIDO EL RANDOM FOREST)
+# 6. FILTRADO DE CARACTERÍSTICAS (PERMUTATION IMPORTANCE EN TEST)
 # ==============================================================================
-rf_model = modelos_supervisados["2. Random Forest (200 árboles)"]
-importancias = pd.DataFrame({
-    "Variable": features,
-    "Importancia (%)": np.round(rf_model.feature_importances_ * 100, 2),
-}).sort_values(by="Importancia (%)", ascending=False)
+print(
+    "\nCalculando Permutation Importance sobre HistGradientBoosting"
+    " Regularizado..."
+)
+hgb_reg = modelos_supervisados["5. HistGradientBoosting (Regularizado)"]
+perm_imp = permutation_importance(
+    hgb_reg,
+    X_test_scaled,
+    y_test,
+    scoring="roc_auc",
+    n_repeats=5,
+    random_state=42,
+    n_jobs=-1,
+)
 
-print("\n=== RANKING DE IMPORTANCIA DE VARIABLES (RANDOM FOREST) ===")
-print(importancias.to_string(index=False))
+df_perm = pd.DataFrame({
+    "Variable": features,
+    "Impacto en ROC-AUC": np.round(perm_imp.importances_mean, 5),
+    "Desviación": np.round(perm_imp.importances_std, 5),
+}).sort_values(by="Impacto en ROC-AUC", ascending=False)
+
+print(
+    "\n=== RANKING REAL DE VARIABLES (PERMUTATION IMPORTANCE EN ROC-AUC) ==="
+)
+print(df_perm.to_string(index=False))
+
+# ==============================================================================
+# 7. ANÁLISIS DE THRESHOLDS SOBRE LA CURVA ROC (REDUCCIÓN DE FALSOS POSITIVOS)
+# ==============================================================================
+_, _, _, _, probs_hgb = curvas_roc["5. HistGradientBoosting (Regularizado)"]
+cortes_prueba = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+analisis_cortes = []
+
+for th in cortes_prueba:
+  pred_th = (probs_hgb >= th).astype(int)
+  tp = int(((pred_th == 1) & (y_test == 1)).sum())
+  fp = int(((pred_th == 1) & (y_test == 0)).sum())
+  fn = total_ataques_test - tp
+
+  analisis_cortes.append({
+      "Threshold (Probabilidad)": th,
+      "Alertas Totales": int(pred_th.sum()),
+      "Ataques Cazados (TP)": tp,
+      "Falsos Negativos (FN)": fn,
+      "Falsos Positivos (FP)": fp,
+      "Recall (%)": round((tp / total_ataques_test) * 100, 2),
+      "Precisión (%)": round(
+          precision_score(y_test, pred_th, zero_division=0) * 100, 2
+      ),
+  })
+
+df_th = pd.DataFrame(analisis_cortes)
+print(
+    "\n=== EFECTO DE MOVER EL THRESHOLD EN HISTGRADIENTBOOSTING REGULARIZADO"
+    " ==="
+)
+print(df_th.to_string(index=False))
+
+# ==============================================================================
+# 8. GRÁFICA DE LA CURVA ROC COMPARATIVA
+# ==============================================================================
+plt.figure(figsize=(10, 7))
+for nombre, (fpr, tpr, _, roc_auc, _) in curvas_roc.items():
+  plt.plot(fpr, tpr, lw=2, label=f"{nombre} (AUC = {roc_auc:.4f})")
+
+plt.plot(
+    [0, 1],
+    [0, 1],
+    color="navy",
+    lw=1.5,
+    linestyle="--",
+    label="Azar (AUC = 0.5000)",
+)
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel(
+    "Tasa de Falsos Positivos (FPR - Usuarios legítimos alertados)", fontsize=11
+)
+plt.ylabel("Tasa de Verdaderos Positivos (TPR / Recall)", fontsize=11)
+plt.title(
+    "Curvas ROC Comparativas - Detección de Account Takeover (RBA)", fontsize=13
+)
+plt.legend(loc="lower right", fontsize=9.5)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
