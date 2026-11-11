@@ -29,7 +29,7 @@ df = pd.read_csv(FILE_PATH, nrows=50000)
 df["Login Timestamp"] = pd.to_datetime(df["Login Timestamp"], errors="coerce")
 df = df.sort_values(by=["User ID", "Login Timestamp"]).reset_index(drop=True)
 
-df["login_hour"] = df["Login Timestamp"].dt.hour.fillna(12)
+df["login_hour"] = df["Login Timestamp"].dt.hour.fillna(12).astype(int)
 df["RTT_clean"] = df["Round-Trip Time [ms]"].fillna(
     df["Round-Trip Time [ms]"].median()
 )
@@ -61,7 +61,7 @@ df["user_delta_rtt"] = (
 )
 
 
-# 2.2 Detección de nuevas entidades en la historia del usuario
+# 2.2 Detección de nuevo dispositivo en la historia del usuario
 def flag_new_entity(series):
   seen = set()
   flags = []
@@ -74,11 +74,6 @@ def flag_new_entity(series):
   return flags
 
 
-df["is_new_country_user"] = df.groupby("User ID")["Country"].transform(
-    flag_new_entity
-)
-df["is_new_asn_user"] = df.groupby("User ID")["ASN"].transform(flag_new_entity)
-
 df["device_fingerprint"] = (
     df["Browser Name and Version"]
     + "_"
@@ -90,46 +85,62 @@ df["is_new_device_user"] = df.groupby("User ID")[
     "device_fingerprint"
 ].transform(flag_new_entity)
 
-# 2.3 Fallo inmediatamente anterior
-df["prev_failed_login"] = (
-    df.groupby("User ID")["Login_Success_num"]
-    .shift(1)
-    .apply(lambda x: 1 if x == 0 else 0)
-    .fillna(0)
-)
-
-# --- NUEVAS CARACTERÍSTICAS AÑADIDAS TRAS FEEDBACK ---
-
-# 2.4 Tiempo en segundos desde el último login (detección de fuerza bruta/diccionario)
+# 2.3 Tiempo en segundos desde el último login (detección de fuerza bruta/diccionario)
 df["time_since_last_login"] = (
     df.groupby("User ID")["Login Timestamp"]
     .diff()
     .dt.total_seconds()
     .fillna(999999)
 )
-# Acotamos a un máximo de 7 días (604800 s) para evitar que valores extremos distorsionen el escalador
 df["time_since_last_login"] = df["time_since_last_login"].clip(
     lower=0, upper=604800
 )
 
-# 2.5 Interacción cruzada País + ASN (detecta ASNs operando fuera de su región habitual)
+# 2.4 Interacción cruzada País + ASN
 df["asn_x_country"] = df["Country"] + "_" + df["ASN"]
-freq_cross = df["asn_x_country"].value_counts(normalize=True)
-df["asn_x_country_freq"] = df["asn_x_country"].map(freq_cross)
+df["asn_x_country_freq"] = df["asn_x_country"].map(
+    df["asn_x_country"].value_counts(normalize=True)
+)
 
-# 2.6 Cruce: Nuevo dispositivo + Fallo en el intento previo
-df["device_change_with_failed_login"] = (
-    (df["is_new_device_user"] == 1) & (df["prev_failed_login"] == 1)
-).astype(int)
+# --- NUEVAS CARACTERÍSTICAS ACORDADAS ---
 
-# 2.7 Cruce: Nuevo dispositivo + Fallo de contraseña en el intento actual
-df["device_change_on_failure"] = (
-    (df["is_new_device_user"] == 1) & (df["Login_Success_num"] == 0)
-).astype(int)
+# 2.5 Interacción cruzada Hora + País
+df["hour_x_country"] = df["login_hour"].astype(str) + "_" + df["Country"]
+df["hour_x_country_freq"] = df["hour_x_country"].map(
+    df["hour_x_country"].value_counts(normalize=True)
+)
+
+# 2.6 Interacción cruzada Hora + ASN
+df["hour_x_asn"] = df["login_hour"].astype(str) + "_" + df["ASN"]
+df["hour_x_asn_freq"] = df["hour_x_asn"].map(
+    df["hour_x_asn"].value_counts(normalize=True)
+)
+
+# 2.7 Desviación de la hora habitual de conexión del usuario (sin leakage)
+df["user_hour_mean_prev"] = df.groupby("User ID")["login_hour"].transform(
+    lambda x: x.shift(1).expanding().mean()
+)
+df["user_delta_hour"] = (
+    (df["login_hour"] - df["user_hour_mean_prev"]).abs().fillna(0)
+)
+
+# 2.8 Indicador de acceso en horario nocturno (00:00 a 06:00)
+df["is_night_login"] = df["login_hour"].apply(
+    lambda h: 1 if 0 <= h <= 6 else 0
+)
+
+# 2.9 Interacción cruzada Sistema Operativo + Navegador
+df["os_x_browser"] = (
+    df["OS Name and Version"] + "_" + df["Browser Name and Version"]
+)
+df["os_x_browser_freq"] = df["os_x_browser"].map(
+    df["os_x_browser"].value_counts(normalize=True)
+)
 
 # ==============================================================================
 # 3. PREPARACIÓN SUPERVISADA: DIVISIÓN TRAIN / TEST (80% / 20%)
 # ==============================================================================
+# Se han eliminado las 5 variables con impacto nulo/negativo y añadido las 5 nuevas
 features = [
     "login_hour",
     "RTT_clean",
@@ -140,14 +151,14 @@ features = [
     "OS Name and Version_freq",
     "Device Type_freq",
     "user_delta_rtt",
-    "is_new_country_user",
-    "is_new_asn_user",
     "is_new_device_user",
-    "prev_failed_login",
     "time_since_last_login",
     "asn_x_country_freq",
-    "device_change_with_failed_login",
-    "device_change_on_failure",
+    "hour_x_country_freq",
+    "hour_x_asn_freq",
+    "user_delta_hour",
+    "is_night_login",
+    "os_x_browser_freq",
 ]
 
 X = df[features]
@@ -247,8 +258,8 @@ for nombre, modelo in modelos_supervisados.items():
 
 df_res = pd.DataFrame(resultados)
 print(
-    "\n=== TABLA DE RESULTADOS CON 17 VARIABLES (CORTE POR DEFECTO P >= 0.50)"
-    " ==="
+    "\n=== TABLA DE RESULTADOS CON 17 VARIABLES DEPURADAS (CORTE POR DEFECTO P"
+    " >= 0.50) ==="
 )
 print(df_res.to_string(index=False))
 
