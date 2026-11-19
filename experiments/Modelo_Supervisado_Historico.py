@@ -1,3 +1,15 @@
+"""
+Motor de Autenticación Basada en Riesgo (RBA) y Política Adaptativa Step-Up MFA
+================================================================================
+- Particionado cronológico estricto: 60% Train / 20% Validación / 20% Test Final
+- Codificado de frecuencias aislado (Leak-Free) calculado exclusivamente sobre Train
+- Vector fijo de 19 características depuradas (14 base + 5 de afinidad histórica
+  por usuario y control de Cold Start / cuenta centinela)
+- Comparativa integral: Baseline Heurístico (Reglas IAM) vs. 6 Modelos Supervisados
+- Simulación operativa de matriz de decisión adaptativa en tres niveles (Step-Up MFA)
+"""
+
+import time
 import warnings
 from lightgbm import LGBMClassifier
 import matplotlib.pyplot as plt
@@ -15,113 +27,23 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 1. CARGA AMPLIADA DEL DATASET (200.000 REGISTROS PARA DENSIDAD HISTÓRICA)
+# CONFIGURACIÓN GLOBAL DEL EXPERIMENTO
 # ==============================================================================
 FILE_PATH = "/kaggle/input/datasets/dasgroup/rba-dataset/rba-dataset.csv"
+N_ROWS = 600000
+POS_WEIGHT = 4.0
+TH_BAJO = 0.35
+TH_ALTO = 0.70
 
-print("1. Cargando muestra ampliada (200.000 registros)...")
-df = pd.read_csv(FILE_PATH, nrows=200000)
-
-df["Login Timestamp"] = pd.to_datetime(df["Login Timestamp"], errors="coerce")
-
-# Ordenación global cronológica inicial para variables de red (IP compartida)
-df = df.sort_values(by="Login Timestamp").reset_index(drop=True)
-
-df["login_hour"] = df["Login Timestamp"].dt.hour.fillna(12).astype(int)
-df["Login_Success_num"] = df["Login Successful"].astype(int)
-
-# ==============================================================================
-# 2. INGENIERÍA DE CARACTERÍSTICAS DEPURADA (14 VARIABLES ÓPTIMAS)
-# ==============================================================================
-print(
-    "2. Generando características seleccionadas de red, usuario e"
-    " interacciones..."
-)
-
-# 2.1 Detección de Password Spraying / Credential Stuffing (ip_unique_users_prev)
-ip_col = "IP Address" if "IP Address" in df.columns else "ASN"
-
-
-def count_prev_unique_users(df_in, group_col):
-  seen_users_per_ip = {}
-  counts = []
-  for ip, user in zip(df_in[group_col], df_in["User ID"]):
-    if ip not in seen_users_per_ip:
-      seen_users_per_ip[ip] = set()
-    counts.append(len(seen_users_per_ip[ip]))
-    seen_users_per_ip[ip].add(user)
-  return counts
-
-
-df["ip_unique_users_prev"] = count_prev_unique_users(df, ip_col)
-
-# Reordenamos por Usuario y Timestamp para calcular el historial individual de cada cuenta
-df = df.sort_values(by=["User ID", "Login Timestamp"]).reset_index(drop=True)
-
-# 2.2 Frequency Encoding de variables categóricas base + User-Agent completo (ua_freq)
-cat_cols = [
-    "Country",
-    "ASN",
-    "Browser Name and Version",
-    "OS Name and Version",
-    "Device Type",
-]
-for col in cat_cols:
-  df[col] = df[col].astype(str)
-  df[col + "_freq"] = df[col].map(df[col].value_counts(normalize=True))
-
-if "User Agent String" in df.columns:
-  df["User Agent String"] = df["User Agent String"].astype(str)
-  df["ua_freq"] = df["User Agent String"].map(
-      df["User Agent String"].value_counts(normalize=True)
-  )
-else:
-  df["ua_freq"] = (
-      df["Browser Name and Version_freq"] * df["OS Name and Version_freq"]
-  )
-
-# 2.3 Desviación horaria del usuario (sin data leakage)
-df["user_hour_mean_prev"] = df.groupby("User ID")["login_hour"].transform(
-    lambda x: x.shift(1).expanding().mean()
-)
-df["user_delta_hour"] = (
-    (df["login_hour"] - df["user_hour_mean_prev"]).abs().fillna(0)
-)
-
-# 2.4 Cruces de interacción de alto impacto
-df["asn_x_country"] = df["Country"] + "_" + df["ASN"]
-df["asn_x_country_freq"] = df["asn_x_country"].map(
-    df["asn_x_country"].value_counts(normalize=True)
-)
-
-df["hour_x_country"] = df["login_hour"].astype(str) + "_" + df["Country"]
-df["hour_x_country_freq"] = df["hour_x_country"].map(
-    df["hour_x_country"].value_counts(normalize=True)
-)
-
-df["hour_x_asn"] = df["login_hour"].astype(str) + "_" + df["ASN"]
-df["hour_x_asn_freq"] = df["hour_x_asn"].map(
-    df["hour_x_asn"].value_counts(normalize=True)
-)
-
-df["os_x_browser"] = (
-    df["OS Name and Version"] + "_" + df["Browser Name and Version"]
-)
-df["os_x_browser_freq"] = df["os_x_browser"].map(
-    df["os_x_browser"].value_counts(normalize=True)
-)
-
-# ==============================================================================
-# 3. SELECCIÓN FINAL (14 VARIABLES) Y PARTICIONADO ESTRATIFICADO (80% / 20%)
-# ==============================================================================
-features = [
+FEATURES_FINALES = [
+    # 1. Vector base depurado (14 variables)
     "login_hour",
     "Login_Success_num",
     "Country_freq",
@@ -136,46 +58,248 @@ features = [
     "hour_x_country_freq",
     "hour_x_asn_freq",
     "os_x_browser_freq",
+    # 2. Afinidad histórica del usuario y control de Cold Start / Centinela (5 variables)
+    "user_has_history",
+    "is_sentinel_user",
+    "user_country_ratio_prev",
+    "user_asn_ratio_prev",
+    "user_ua_ratio_prev",
 ]
 
-X = df[features]
-y = ((df["Is Attack IP"] == True) | (df["Is Account Takeover"] == True)).astype(
-    int
+
+# ==============================================================================
+# DEFINICIÓN DEL BASELINE HEURÍSTICO (MOTOR DE REGLAS ESTÁTICAS IAM)
+# ==============================================================================
+class HeuristicRBABaseline:
+  """
+  Simula un motor RBA tradicional basado en reglas heurísticas expertas sin ML.
+  Asigna pesos aditivos de riesgo [0.0, 1.0] usando únicamente las 19 variables
+  disponibles para los modelos supervisados.
+  """
+
+  def fit(self, X, y=None):
+    return self
+
+  def predict_proba(self, X_raw):
+    score = np.zeros(len(X_raw), dtype=float)
+
+    # Regla 1: Password Spraying / Credential Stuffing desde una misma IP
+    score += np.where(X_raw["ip_unique_users_prev"] >= 3, 0.35, 0.0)
+
+    # Regla 2: Proveedor de red (ASN) o cruce ASN-País muy infrecuente
+    score += np.where(
+        (X_raw["ASN_freq"] < 0.005) | (X_raw["asn_x_country_freq"] < 0.002),
+        0.25,
+        0.0,
+    )
+
+    # Regla 3: Usuario con historial previo accediendo desde País y ASN inéditos
+    score += np.where(
+        (X_raw["user_has_history"] == 1)
+        & (X_raw["user_country_ratio_prev"] == 0.0)
+        & (X_raw["user_asn_ratio_prev"] == 0.0),
+        0.25,
+        0.0,
+    )
+
+    # Regla 4: Huella de User-Agent automatizada/muy rara o país infrecuente
+    score += np.where(
+        (X_raw["ua_freq"] < 0.001) | (X_raw["Country_freq"] < 0.01),
+        0.20,
+        0.0,
+    )
+
+    # Regla 5: Sondeo sobre el identificador centinela de cuentas inexistentes
+    score += np.where(X_raw["is_sentinel_user"] == 1, 0.15, 0.0)
+
+    score = np.clip(score, 0.0, 1.0)
+    return np.column_stack([1.0 - score, score])
+
+  def predict(self, X_raw):
+    return (self.predict_proba(X_raw)[:, 1] >= 0.50).astype(int)
+
+
+# ==============================================================================
+# FUNCIONES AUXILIARES DE INGENIERÍA DE CARACTERÍSTICAS SIN DATA LEAKAGE
+# ==============================================================================
+def count_prev_unique_users(df_in, group_col):
+  """Cuenta cuántos User ID distintos han usado una IP antes del evento t."""
+  seen = {}
+  counts = []
+  for entity, user in zip(df_in[group_col], df_in["User ID"]):
+    if entity not in seen:
+      seen[entity] = set()
+    counts.append(len(seen[entity]))
+    seen[entity].add(user)
+  return counts
+
+
+def apply_leak_free_frequencies(train, val, test, cols_to_encode):
+  """Calcula frecuencias relativas solo en Train y las proyecta en Val y Test."""
+  for col, new_name in cols_to_encode.items():
+    freq_map = train[col].value_counts(normalize=True)
+    train[new_name] = train[col].map(freq_map).fillna(0.0)
+    val[new_name] = val[col].map(freq_map).fillna(0.0)
+    test[new_name] = test[col].map(freq_map).fillna(0.0)
+  return train, val, test
+
+
+# ==============================================================================
+# 1. CARGA Y ORDENACIÓN CRONOLÓGICA DEL DATASET
+# ==============================================================================
+t0 = time.time()
+print(f"[1/6] Cargando {N_ROWS:,} registros desde {FILE_PATH}...")
+df = pd.read_csv(FILE_PATH, nrows=N_ROWS)
+
+df["Login Timestamp"] = pd.to_datetime(df["Login Timestamp"], errors="coerce")
+df = df.sort_values(by="Login Timestamp").reset_index(drop=True)
+
+df["target"] = (
+    (df["Is Attack IP"] == True) | (df["Is Account Takeover"] == True)
+).astype(int)
+df["login_hour"] = df["Login Timestamp"].dt.hour.fillna(12).astype(int)
+df["Login_Success_num"] = df["Login Successful"].astype(int)
+
+cat_cols = [
+    "Country",
+    "ASN",
+    "Browser Name and Version",
+    "OS Name and Version",
+    "Device Type",
+    "User Agent String",
+]
+for col in cat_cols:
+  df[col] = df[col].astype(str)
+
+# ==============================================================================
+# 2. INGENIERÍA DE CARACTERÍSTICAS TEMPORAL (ESTRICTO PASADO t-1)
+# ==============================================================================
+print("[2/6] Construyendo variables históricas y de afinidad por usuario...")
+
+# 2.1 Identificación de User ID centinela (agrupador de cuentas inexistentes)
+user_counts = df["User ID"].value_counts()
+sentinel_user = user_counts.index[0] if user_counts.iloc[0] > 1000 else None
+df["is_sentinel_user"] = (df["User ID"] == sentinel_user).astype(int)
+
+# 2.2 Historial de afinidad por usuario (sin premiar antigüedad bruta)
+df["user_prev_logins"] = df.groupby("User ID").cumcount()
+df["user_has_history"] = (
+    (df["user_prev_logins"] > 0) & (df["is_sentinel_user"] == 0)
+).astype(int)
+
+for col, alias in [
+    ("Country", "country"),
+    ("ASN", "asn"),
+    ("User Agent String", "ua"),
+]:
+  prev_same = df.groupby(["User ID", col]).cumcount()
+  df[f"user_{alias}_ratio_prev"] = np.where(
+      df["user_has_history"] == 1,
+      prev_same / df["user_prev_logins"],
+      -1.0,
+  )
+
+# 2.3 Desviación horaria respecto al comportamiento histórico del usuario
+df["user_hour_mean_prev"] = df.groupby("User ID")["login_hour"].transform(
+    lambda x: x.shift(1).expanding().mean()
+)
+df["user_delta_hour"] = (
+    (df["login_hour"] - df["user_hour_mean_prev"]).abs().fillna(0.0)
 )
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.20, random_state=42, stratify=y
+# 2.4 Expansión de cuentas distintas por IP (Password Spraying)
+ip_col = "IP Address" if "IP Address" in df.columns else "ASN"
+df["ip_unique_users_prev"] = count_prev_unique_users(df, ip_col)
+
+# 2.5 Variables categóricas compuestas para Frequency Encoding
+df["asn_x_country"] = df["Country"] + "_" + df["ASN"]
+df["hour_x_country"] = df["login_hour"].astype(str) + "_" + df["Country"]
+df["hour_x_asn"] = df["login_hour"].astype(str) + "_" + df["ASN"]
+df["os_x_browser"] = (
+    df["OS Name and Version"] + "_" + df["Browser Name and Version"]
 )
 
-# Conservamos los nombres de las columnas tras el escalado para evitar UserWarnings
+# ==============================================================================
+# 3. PARTICIONADO CRONOLÓGICO 60/20/20 Y CODIFICADO DE FRECUENCIAS SIN FUGA
+# ==============================================================================
+print("[3/6] Aplicando split cronológico 60% Train / 20% Val / 20% Test...")
+n = len(df)
+train_end = int(n * 0.60)
+val_end = int(n * 0.80)
+
+train_df = df.iloc[:train_end].copy()
+val_df = df.iloc[train_end:val_end].copy()
+test_df = df.iloc[val_end:].copy()
+
+cols_frecuencia = {
+    "Country": "Country_freq",
+    "ASN": "ASN_freq",
+    "Browser Name and Version": "Browser Name and Version_freq",
+    "OS Name and Version": "OS Name and Version_freq",
+    "Device Type": "Device Type_freq",
+    "User Agent String": "ua_freq",
+    "asn_x_country": "asn_x_country_freq",
+    "hour_x_country": "hour_x_country_freq",
+    "hour_x_asn": "hour_x_asn_freq",
+    "os_x_browser": "os_x_browser_freq",
+}
+
+train_df, val_df, test_df = apply_leak_free_frequencies(
+    train_df, val_df, test_df, cols_frecuencia
+)
+
+# Escalado estándar ajustado exclusivamente en Train
 scaler = StandardScaler()
-X_train_scaled = pd.DataFrame(
-    scaler.fit_transform(X_train), columns=features, index=X_train.index
+X_train = pd.DataFrame(
+    scaler.fit_transform(train_df[FEATURES_FINALES]),
+    columns=FEATURES_FINALES,
+    index=train_df.index,
 )
-X_test_scaled = pd.DataFrame(
-    scaler.transform(X_test), columns=features, index=X_test.index
-)
+y_train = train_df["target"]
 
-total_ataques_test = int(y_test.sum())
+X_val = pd.DataFrame(
+    scaler.transform(val_df[FEATURES_FINALES]),
+    columns=FEATURES_FINALES,
+    index=val_df.index,
+)
+y_val = val_df["target"]
+
+X_test = pd.DataFrame(
+    scaler.transform(test_df[FEATURES_FINALES]),
+    columns=FEATURES_FINALES,
+    index=test_df.index,
+)
+y_test = test_df["target"]
+
 print(
-    f"Filas Entrenamiento: {len(X_train)} | Filas Test: {len(X_test)} | Ataques"
-    f" en Test: {total_ataques_test} | Variables: {len(features)}"
+    f"      Train: {len(X_train):,} | Val: {len(X_val):,} | Test:"
+    f" {len(X_test):,} | Variables: {len(FEATURES_FINALES)}"
 )
 
 # ==============================================================================
-# 4. CALIBRACIÓN DE PESOS MODERADOS (PENALIZACIÓN 4x)
+# 4. ENTRENAMIENTO Y COMPARATIVA INTEGRAL DE MODELOS (HEURÍSTICO + 6 ML)
 # ==============================================================================
-POS_WEIGHT = 4.0
+print("\n[4/6] Entrenando y evaluando todos los algoritmos del proyecto...")
 sample_weights_train = np.where(y_train == 1, POS_WEIGHT, 1.0)
 
+# Formato: (instancia_modelo, usa_sample_weight, usa_datos_crudos_sin_escalar)
 modelos = {
+    "0. Baseline Heurístico (Reglas IAM)": (HeuristicRBABaseline(), False, True),
     "1. Regresión Logística (Baseline)": (
         LogisticRegression(
             class_weight={0: 1.0, 1: POS_WEIGHT}, max_iter=1000, random_state=42
         ),
         False,
+        False,
     ),
-    "2. Random Forest (Optimizado)": (
+    "2. KNN (k=15, pesos distancia)": (
+        KNeighborsClassifier(
+            n_neighbors=15, weights="distance", leaf_size=50, n_jobs=-1
+        ),
+        False,
+        False,
+    ),
+    "3. Random Forest (Optimizado)": (
         RandomForestClassifier(
             n_estimators=250,
             max_depth=14,
@@ -185,24 +309,26 @@ modelos = {
             n_jobs=-1,
         ),
         False,
+        False,
     ),
-    "3. HistGradientBoosting (Tuned + Peso 4x)": (
+    "4. HistGradientBoosting (Tuned + Peso 4x)": (
         HistGradientBoostingClassifier(
-            max_iter=350,
+            max_iter=400,
             learning_rate=0.05,
             max_leaf_nodes=25,
-            min_samples_leaf=40,
+            min_samples_leaf=50,
             l2_regularization=2.0,
             random_state=42,
         ),
         True,
+        False,
     ),
-    "4. LightGBM (Tuned + Peso 4x)": (
+    "5. LightGBM (Tuned + Peso 4x)": (
         LGBMClassifier(
-            n_estimators=350,
+            n_estimators=400,
             learning_rate=0.05,
             num_leaves=25,
-            min_child_samples=40,
+            min_child_samples=50,
             reg_lambda=2.0,
             scale_pos_weight=POS_WEIGHT,
             random_state=42,
@@ -210,13 +336,14 @@ modelos = {
             verbose=-1,
         ),
         False,
+        False,
     ),
-    "5. XGBoost (Tuned + Peso 4x)": (
+    "6. XGBoost (Tuned + Peso 4x)": (
         XGBClassifier(
-            n_estimators=350,
+            n_estimators=400,
             learning_rate=0.05,
             max_depth=6,
-            min_child_weight=40,
+            min_child_weight=50,
             reg_lambda=2.0,
             scale_pos_weight=POS_WEIGHT,
             eval_metric="logloss",
@@ -224,69 +351,115 @@ modelos = {
             n_jobs=-1,
         ),
         False,
+        False,
     ),
 }
 
-# ==============================================================================
-# 5. ENTRENAMIENTO Y EVALUACIÓN (ROC-AUC + PR-AUC)
-# ==============================================================================
-resultados = []
-curvas = {}
+resultados_val = []
+resultados_test = []
+curvas_test = {}
+total_ataques_val = int(y_val.sum())
+total_ataques_test = int(y_test.sum())
 
-for nombre, (modelo, usa_sample_weight) in modelos.items():
-  print(f"Entrenando {nombre}...")
+for nombre, (modelo, usa_sample_weight, usa_raw) in modelos.items():
+  t_mod = time.time()
+  print(f"   -> Ejecutando {nombre}...")
+
+  X_tr_in = train_df[FEATURES_FINALES] if usa_raw else X_train
+  X_va_in = val_df[FEATURES_FINALES] if usa_raw else X_val
+  X_te_in = test_df[FEATURES_FINALES] if usa_raw else X_test
+
   if usa_sample_weight:
-    modelo.fit(X_train_scaled, y_train, sample_weight=sample_weights_train)
+    modelo.fit(X_tr_in, y_train, sample_weight=sample_weights_train)
   else:
-    modelo.fit(X_train_scaled, y_train)
+    modelo.fit(X_tr_in, y_train)
 
-  y_pred = modelo.predict(X_test_scaled)
-  y_prob = modelo.predict_proba(X_test_scaled)[:, 1]
+  # Evaluación en Validación (20% intermedio)
+  prob_va = modelo.predict_proba(X_va_in)[:, 1]
+  pred_va = (prob_va >= 0.50).astype(int)
+  tp_va = int(((pred_va == 1) & (y_val == 1)).sum())
+  fp_va = int(((pred_va == 1) & (y_val == 0)).sum())
+  fn_va = total_ataques_val - tp_va
 
-  fpr, tpr, _ = roc_curve(y_test, y_prob)
-  prec_curve, rec_curve, _ = precision_recall_curve(y_test, y_prob)
-
-  roc_auc = roc_auc_score(y_test, y_prob)
-  pr_auc = average_precision_score(y_test, y_prob)
-  curvas[nombre] = (fpr, tpr, prec_curve, rec_curve, roc_auc, pr_auc, y_prob)
-
-  tp = int(((y_pred == 1) & (y_test == 1)).sum())
-  fp = int(((y_pred == 1) & (y_test == 0)).sum())
-  fn = total_ataques_test - tp
-
-  resultados.append({
+  resultados_val.append({
       "Algoritmo": nombre,
-      "Alertas": int(y_pred.sum()),
-      "Cazados (TP)": tp,
-      "Dejados Fuera (FN)": fn,
-      "% Dejados Fuera": round((fn / total_ataques_test) * 100, 2),
-      "Falsos Positivos (FP)": fp,
+      "ROC-AUC": round(roc_auc_score(y_val, prob_va), 4),
+      "PR-AUC": round(average_precision_score(y_val, prob_va), 4),
       "Recall (%)": round(
-          recall_score(y_test, y_pred, zero_division=0) * 100, 2
+          recall_score(y_val, pred_va, zero_division=0) * 100, 2
       ),
       "Precisión (%)": round(
-          precision_score(y_test, y_pred, zero_division=0) * 100, 2
+          precision_score(y_val, pred_va, zero_division=0) * 100, 2
       ),
-      "F1-Score": round(f1_score(y_test, y_pred, zero_division=0), 4),
-      "ROC-AUC": round(roc_auc, 4),
-      "PR-AUC": round(pr_auc, 4),
+      "F1-Score": round(f1_score(y_val, pred_va, zero_division=0), 4),
+      "TP": tp_va,
+      "FP": fp_va,
+      "FN": fn_va,
   })
 
-df_res = pd.DataFrame(resultados)
-print(
-    "\n=== TABLA COMPARATIVA DE EFICIENCIA (14 VARIABLES DEPURADAS | CORTE 0.50)"
-    " ==="
-)
-print(df_res.to_string(index=False))
+  # Evaluación en Test Final (20% futuro)
+  prob_te = modelo.predict_proba(X_te_in)[:, 1]
+  pred_te = (prob_te >= 0.50).astype(int)
+  tp_te = int(((pred_te == 1) & (y_test == 1)).sum())
+  fp_te = int(((pred_te == 1) & (y_test == 0)).sum())
+  fn_te = total_ataques_test - tp_te
+
+  roc_te = roc_auc_score(y_test, prob_te)
+  pr_te = average_precision_score(y_test, prob_te)
+  fpr_te, tpr_te, _ = roc_curve(y_test, prob_te)
+  prec_c_te, rec_c_te, _ = precision_recall_curve(y_test, prob_te)
+  curvas_test[nombre] = (
+      fpr_te,
+      tpr_te,
+      prec_c_te,
+      rec_c_te,
+      roc_te,
+      pr_te,
+      prob_te,
+  )
+
+  resultados_test.append({
+      "Algoritmo": nombre,
+      "Alertas": int(pred_te.sum()),
+      "Cazados (TP)": tp_te,
+      "Dejados Fuera (FN)": fn_te,
+      "Falsos Positivos (FP)": fp_te,
+      "Recall (%)": round(
+          recall_score(y_test, pred_te, zero_division=0) * 100, 2
+      ),
+      "Precisión (%)": round(
+          precision_score(y_test, pred_te, zero_division=0) * 100, 2
+      ),
+      "F1-Score": round(f1_score(y_test, pred_te, zero_division=0), 4),
+      "ROC-AUC": round(roc_te, 4),
+      "PR-AUC": round(pr_te, 4),
+      "Tiempo (s)": round(time.time() - t_mod, 1),
+  })
+
+print("\n=== TABLA 1: COMPARATIVA EN VALIDACIÓN CRONOLÓGICA (120.000 FILAS) ===")
+print(pd.DataFrame(resultados_val).to_string(index=False))
+
+print("\n=== TABLA 2: EVALUACIÓN FINAL EN TEST CRONOLÓGICO (120.000 FILAS) ===")
+print(pd.DataFrame(resultados_test).to_string(index=False))
 
 # ==============================================================================
-# 6. RANKING DE IMPORTANCIA DE VARIABLES (PERMUTATION IMPORTANCE)
+# 5. IMPORTANCIA DE VARIABLES Y SIMULACIÓN OPERATIVA STEP-UP MFA
 # ==============================================================================
-print("\nCalculando Permutation Importance sobre LightGBM...")
-mejor_lgbm = modelos["4. LightGBM (Tuned + Peso 4x)"][0]
+print("\n[5/6] Calculando Permutation Importance y Matriz Step-Up MFA en Test...")
+
+# Seleccionamos dinámicamente el mejor modelo según PR-AUC en Validación
+df_val_res = pd.DataFrame(resultados_val)
+mejor_nombre = df_val_res.sort_values(by="PR-AUC", ascending=False).iloc[0][
+    "Algoritmo"
+]
+print(f"Modelo líder seleccionado según Validación: {mejor_nombre}")
+
+mejor_modelo, _, mejor_usa_raw = modelos[mejor_nombre]
+X_test_perm = test_df[FEATURES_FINALES] if mejor_usa_raw else X_test
+
 perm_imp = permutation_importance(
-    mejor_lgbm,
-    X_test_scaled,
+    mejor_modelo,
+    X_test_perm,
     y_test,
     scoring="roc_auc",
     n_repeats=3,
@@ -295,62 +468,104 @@ perm_imp = permutation_importance(
 )
 
 df_perm = pd.DataFrame({
-    "Variable": features,
+    "Variable": FEATURES_FINALES,
     "Impacto en ROC-AUC": np.round(perm_imp.importances_mean, 5),
     "Desviación": np.round(perm_imp.importances_std, 5),
 }).sort_values(by="Impacto en ROC-AUC", ascending=False)
 
-print("\n=== RANKING FINAL DE VARIABLES (14 FEATURES) ===")
+print(f"\n=== RANKING FINAL DE VARIABLES ({len(FEATURES_FINALES)} FEATURES) ===")
 print(df_perm.to_string(index=False))
 
+# Simulación de Matriz Adaptativa Step-Up MFA sobre el modelo líder en Test
+probs_test_lider = curvas_test[mejor_nombre][6]
+
+banda_baja = probs_test_lider < TH_BAJO
+banda_media = (probs_test_lider >= TH_BAJO) & (probs_test_lider < TH_ALTO)
+banda_alta = probs_test_lider >= TH_ALTO
+
+total_legitimos_test = int((y_test == 0).sum())
+
+matriz_mfa = pd.DataFrame([
+    {
+        "Nivel de Riesgo": f"Bajo (P < {TH_BAJO})",
+        "Acción IAM": "Acceso Directo (Sin fricción)",
+        "Total Accesos": int(banda_baja.sum()),
+        "Legítimos (%)": round(
+            ((banda_baja & (y_test == 0)).sum() / total_legitimos_test) * 100,
+            2,
+        ),
+        "Ataques (%)": round(
+            ((banda_baja & (y_test == 1)).sum() / total_ataques_test) * 100, 2
+        ),
+    },
+    {
+        "Nivel de Riesgo": f"Medio ({TH_BAJO} <= P < {TH_ALTO})",
+        "Acción IAM": "Desafío Step-Up MFA (OTP/Push)",
+        "Total Accesos": int(banda_media.sum()),
+        "Legítimos (%)": round(
+            ((banda_media & (y_test == 0)).sum() / total_legitimos_test) * 100,
+            2,
+        ),
+        "Ataques (%)": round(
+            ((banda_media & (y_test == 1)).sum() / total_ataques_test) * 100, 2
+        ),
+    },
+    {
+        "Nivel de Riesgo": f"Crítico (P >= {TH_ALTO})",
+        "Acción IAM": "Bloqueo Preventivo",
+        "Total Accesos": int(banda_alta.sum()),
+        "Legítimos (%)": round(
+            ((banda_alta & (y_test == 0)).sum() / total_legitimos_test) * 100,
+            2,
+        ),
+        "Ataques (%)": round(
+            ((banda_alta & (y_test == 1)).sum() / total_ataques_test) * 100, 2
+        ),
+    },
+])
+
+print(f"\n=== MATRIZ OPERATIVA STEP-UP MFA EN TEST ({mejor_nombre}) ===")
+print(matriz_mfa.to_string(index=False))
+
 # ==============================================================================
-# 7. BARRIDO DE THRESHOLDS EN EL MODELO LÍDER (LIGHTGBM)
+# 6. VISUALIZACIÓN COMPARATIVA: CURVAS ROC Y PRECISION-RECALL EN TEST
 # ==============================================================================
-_, _, _, _, _, _, probs_opt = curvas["4. LightGBM (Tuned + Peso 4x)"]
-cortes = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
-tabla_th = []
+print("\n[6/6] Generando gráficas comparativas ROC y Precision-Recall...")
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6.5))
 
-for th in cortes:
-  p_th = (probs_opt >= th).astype(int)
-  tp = int(((p_th == 1) & (y_test == 1)).sum())
-  fp = int(((p_th == 1) & (y_test == 0)).sum())
-  fn = total_ataques_test - tp
-  tabla_th.append({
-      "Threshold": th,
-      "Alertas": int(p_th.sum()),
-      "Cazados (TP)": tp,
-      "Dejados Fuera (FN)": fn,
-      "Falsos Positivos (FP)": fp,
-      "Recall (%)": round((tp / total_ataques_test) * 100, 2),
-      "Precisión (%)": round(
-          precision_score(y_test, p_th, zero_division=0) * 100, 2
-      ),
-  })
+for nombre, (fpr, tpr, prec_c, rec_c, roc_auc, pr_auc, _) in curvas_test.items():
+  estilo = "--" if "Heurístico" in nombre or "Logística" in nombre else "-"
+  grosor = 1.6 if estilo == "--" else 2.1
+  ax1.plot(
+      fpr,
+      tpr,
+      linestyle=estilo,
+      lw=grosor,
+      label=f"{nombre} (AUC={roc_auc:.4f})",
+  )
+  ax2.plot(
+      rec_c,
+      prec_c,
+      linestyle=estilo,
+      lw=grosor,
+      label=f"{nombre} (PR-AUC={pr_auc:.4f})",
+  )
 
-print("\n=== ANÁLISIS DE THRESHOLDS (LIGHTGBM TUNED) ===")
-print(pd.DataFrame(tabla_th).to_string(index=False))
-
-# ==============================================================================
-# 8. DOBLE GRÁFICA: CURVA ROC Y CURVA PRECISION-RECALL
-# ==============================================================================
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-
-for nombre, (fpr, tpr, prec_c, rec_c, roc_auc, pr_auc, _) in curvas.items():
-  ax1.plot(fpr, tpr, lw=2, label=f"{nombre} (AUC={roc_auc:.4f})")
-  ax2.plot(rec_c, prec_c, lw=2, label=f"{nombre} (PR-AUC={pr_auc:.4f})")
-
-ax1.plot([0, 1], [0, 1], "k--", lw=1)
-ax1.set_title("Curvas ROC Comparativas")
+ax1.plot([0, 1], [0, 1], "k:", lw=1, label="Azar (AUC=0.5000)")
+ax1.set_title("Curvas ROC Comparativas (Test Cronológico 120k)")
 ax1.set_xlabel("Tasa de Falsos Positivos (FPR)")
 ax1.set_ylabel("Tasa de Verdaderos Positivos (Recall)")
-ax1.legend(loc="lower right", fontsize=8.5)
+ax1.legend(loc="lower right", fontsize=8)
 ax1.grid(alpha=0.3)
 
 ax2.set_title("Curvas Precision-Recall (Foco en Clase Minoritaria)")
 ax2.set_xlabel("Recall (Fracción de Ataques Cazados)")
 ax2.set_ylabel("Precisión (Pureza de las Alertas)")
-ax2.legend(loc="upper right", fontsize=8.5)
+ax2.legend(loc="upper right", fontsize=8)
 ax2.grid(alpha=0.3)
 
 plt.tight_layout()
+plt.savefig("curvas_roc_pr_final_600k.png", dpi=300)
 plt.show()
+
+print(f"\nPipeline finalizado con éxito en {time.time() - t0:.1f} segundos.")
