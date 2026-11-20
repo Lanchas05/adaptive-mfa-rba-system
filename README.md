@@ -15,9 +15,8 @@ El desarrollo sigue un marco iterativo e incremental. A continuación se resumen
 * **Resultado (Review):** Se diseñaron variables dinámicas mediante ventanas expansivas desplazadas (`shift(1).expanding()`) como `user_delta_rtt` y detección de nuevas entidades con conjuntos hash (`set()`). A pesar de enriquecer la señal, los algoritmos no supervisados mantuvieron una tasa inaceptable de falsos negativos (>88%), confirmando la necesidad de guiar el entrenamiento mediante etiquetas reales.
 * **Decisión:** Migrar el motor central a **Aprendizaje Supervisado** compensando el desbalanceo de clases (ratio 10:1).
 
- ### 🔹 Sprint 3: Clasificación Supervisada, Selección de Variables y Curva ROC (09 Nov – 13 Nov 2026) *(En curso)*
-* **Objetivo:** Entrenar clasificadores supervisados con balanceo de pesos, depurar variables mediante *Permutation Importance* y calibrar umbrales sobre la curva ROC.
-* **Resultado parcial (Review):** 
-  * Se incorporaron interacciones cruzadas (`asn_x_country_freq`, `hour_x_country_freq`, `os_x_browser_freq`) que se posicionaron en el Top 5 de impacto predictivo, eliminando variables ruidosas.
-  * **HistGradientBoosting** alcanzó un **ROC-AUC de 0.9205** y un **Recall del 88.38%** en el conjunto de test independiente (10.000 filas).
-  * El análisis de umbrales sobre la curva ROC demostró que elevar el corte de decisión a la franja `0.65 - 0.70` recorta más de 200 falsos positivos manteniendo un Recall superior al 80%.
+### 🔹 Sprint 3: Modelado Supervisado, Selección de Variables y Curva ROC (09 Nov – 20 Nov 2026)
+
+* **Objetivo:** Entrenar, auditar y optimizar un clasificador supervisado libre de fuga de datos (*data leakage*) para gobernar una política adaptativa **Step-Up MFA**[cite: 11].
+* **Resultado (Review):** Se blindó el *pipeline* mediante particionado cronológico estricto (`60/20/20`) sobre 600.000 registros y se consolidó un vector óptimo de **19 variables** (*Permutation Importance* y ablación)[cite: 8, 9, 11]. **XGBoost** e **HistGradientBoosting** lideraron la comparativa (`ROC-AUC ≈ 0.90`, `PR-AUC = 0.5141 – 0.5207`, `Recall ≈ 79,8%`) frente al *Baseline Heurístico* (`PR-AUC = 0.2007`), neutralizando el **86,40% de los ataques** con un **82,49% de accesos legítimos sin fricción**[cite: 8, 9, 10].
+* **Decisión:** Priorizar el **Recall** y la **latencia de inferencia en Test** para elegir el modelo final, evaluar la integración backend (**Odoo** frente a API REST desacoplada) con **MFA agnóstico (TOTP)** descartando APIs de Google, formalizar la gestión tipo **Scrumban/Kanban** y avanzar bajo **GitFlow** hacia el **MVP (`v1.0.0`)** en `main`.
